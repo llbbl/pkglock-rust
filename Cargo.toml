@@ -1,7 +1,14 @@
 [package]
 name = "pkglock"
 version = "0.1.0"
+authors= ["Logan Lindquist <logan@llbbl.com>"]
 edition = "2021"
+
+description = "A utility to modify URLs in package-lock.json"
+license = "MIT"
+readme = "README.md"
+
+repository = "https://github.com/llbbl/pkglock-rust"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -9,3 +16,12 @@ edition = "2021"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.108"
 regex = "1.10.2"
+
+[[bin]]
+name = "pkglock"
+path = "src/main.rs"
+
+[package.metadata]
+keywords = ["json", "npm", "registry"]
+categories = ["command-line-utilities", "development-tools::build-utils"]
+
