@@ -17,6 +17,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.108"
 regex = "1.10.2"
 
+[lib]
+name = "pkglock_lib"
+path = "src/lib.rs"
+
 [[bin]]
 name = "pkglock"
 path = "src/main.rs"

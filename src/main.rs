@@ -1,30 +1,9 @@
 use std::fs;
-use regex::Regex;
 use serde_json::Value;
 use std::env;
 
-fn update_urls(value: &mut Value, new_url: &str) {
-    if let Value::Object(map) = value {
-        if let Some(resolved) = map.get_mut("resolved") {
-            if resolved.is_string() {
-                let old_url = resolved.as_str().unwrap();
-
-                // Create a regex to match URLs
-                let re = Regex::new(r"https?://[^/]+").unwrap();
-
-                // Replace the matched part of the URL with the new URL
-                let updated_url = re.replace(old_url, new_url);
-                *resolved = Value::String(updated_url.into_owned());
-            }
-        }
-
-        // Recursively update nested objects
-        for key in map.keys().cloned().collect::<Vec<_>>() {
-            update_urls(&mut map[&key], new_url);
-        }
-    }
-}
-
+// Import the update_urls function from the library crate
+use pkglock_lib::update_urls;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read command-line arguments
@@ -61,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config["remote"].as_str().unwrap()
     };
 
-    // Update URLs in package-lock.json
+    // Update URLs in package-lock.json using the library function
     update_urls(&mut json_content, new_url);
 
     // Write the updated JSON back to package-lock.json
