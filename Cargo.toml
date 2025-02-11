@@ -1,6 +1,6 @@
 [package]
 name = "pkglock"
-version = "0.1.0"
+version = "0.2.0"
 authors= ["Logan Lindquist <logan@llbbl.com>"]
 edition = "2021"
 
@@ -9,6 +9,10 @@ license = "MIT"
 readme = "README.md"
 
 repository = "https://github.com/llbbl/pkglock-rust"
+
+[package.metadata]
+keywords = ["json", "npm", "registry"]
+categories = ["command-line-utilities", "development-tools::build-utils"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -24,8 +28,4 @@ path = "src/lib.rs"
 [[bin]]
 name = "pkglock"
 path = "src/main.rs"
-
-[package.metadata]
-keywords = ["json", "npm", "registry"]
-categories = ["command-line-utilities", "development-tools::build-utils"]
 
