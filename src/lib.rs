@@ -1,4 +1,3 @@
-
 // New module to encapsulate the reading, parsing, and updating of package-lock.json, as well as the URL update functionality
 pub mod package_lock_lib {
     use regex::Regex;
@@ -47,9 +46,13 @@ pub mod package_lock_lib {
 
         // Determine new URL based on argument
         let new_url = if arg == "--local" {
-            config["local"].as_str().ok_or("Local URL not found in pkg.config.json")?
+            config["local"]
+                .as_str()
+                .ok_or("Local URL not found in pkg.config.json")?
         } else if arg == "--remote" {
-            config["remote"].as_str().ok_or("Remote URL not found in pkg.config.json")?
+            config["remote"]
+                .as_str()
+                .ok_or("Remote URL not found in pkg.config.json")?
         } else {
             return Err("Invalid argument. Use --local or --remote.".into());
         };
@@ -140,4 +143,4 @@ pub mod package_lock_lib {
             fs::remove_file("package-lock.json").unwrap();
         }
     }
-} 
+}
