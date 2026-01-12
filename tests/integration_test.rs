@@ -1,6 +1,6 @@
+use pkglock_lib::package_lock_lib::{update_urls, update_urls_in_package_lock};
 use serde_json::Value;
 use std::fs;
-use pkglock_lib::package_lock_lib::{update_urls, update_urls_in_package_lock};
 
 #[test]
 fn test_file_operations() {
@@ -71,4 +71,4 @@ fn test_update_urls_in_package_lock() {
     // Clean up temporary files
     fs::remove_file("pkg.config.json").unwrap();
     fs::remove_file("package-lock.json").unwrap();
-} 
+}
