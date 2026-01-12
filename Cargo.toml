@@ -9,8 +9,6 @@ license = "MIT"
 readme = "README.md"
 
 repository = "https://github.com/llbbl/pkglock-rust"
-
-[package.metadata]
 keywords = ["json", "npm", "registry"]
 categories = ["command-line-utilities", "development-tools::build-utils"]
 
