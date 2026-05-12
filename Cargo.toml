@@ -1,8 +1,9 @@
 [package]
 name = "pkglock"
-version = "0.2.0"
+version = "0.3.0"
 authors= ["Logan Lindquist <logan@llbbl.com>"]
 edition = "2021"
+rust-version = "1.86"
 
 description = "A utility to modify URLs in package-lock.json"
 license = "MIT"
@@ -18,6 +19,10 @@ categories = ["command-line-utilities", "development-tools::build-utils"]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.108"
 regex = "1.10.2"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3.27"
 
 [lib]
 name = "pkglock_lib"
