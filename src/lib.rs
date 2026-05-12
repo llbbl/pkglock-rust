@@ -423,6 +423,94 @@ pub fn rewrite_lockfile_to_local(
     Ok(count)
 }
 
+// ---------------------------------------------------------------------------
+// install-hook: write a git pre-commit hook that runs `pkglock --to-public`
+// on staged package-lock.json files.
+// ---------------------------------------------------------------------------
+
+/// Outcome of `install_pre_commit_hook`. Both variants are "no error" — the
+/// caller decides whether `AlreadyExists` triggers a non-zero exit.
+#[derive(Debug)]
+pub enum InstallHookResult {
+    /// The hook did not exist; we wrote it.
+    Installed,
+    /// A `pre-commit` hook already exists; we left it alone.
+    AlreadyExists,
+}
+
+/// Embedded POSIX-sh hook script. Kept inline because it's short.
+const PRE_COMMIT_HOOK: &str = "\
+#!/bin/sh
+# Auto-rewrite local registry URLs in package-lock.json before commit.
+# Installed by `pkglock install-hook`. Safe to delete or edit by hand.
+
+set -e
+cd \"$(git rev-parse --show-toplevel)\"
+
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -q '^package-lock\\.json$'; then
+    exit 0
+fi
+
+if ! command -v pkglock >/dev/null 2>&1; then
+    echo \"pkglock: command not found on PATH — install pkglock or commit with --no-verify\" >&2
+    exit 1
+fi
+
+pkglock --to-public
+git add package-lock.json
+echo \"pkglock: rewrote local URLs in package-lock.json before commit\"
+";
+
+/// Install a `pre-commit` git hook under `repo_root/.git/hooks/`.
+///
+/// `repo_root` must contain a `.git` *directory* (worktrees, whose `.git` is a
+/// file, are not supported in v0.3). The `.git/hooks/` directory is created if
+/// missing. If a `pre-commit` hook is already present it is left untouched and
+/// `AlreadyExists` is returned — the caller is expected to surface that to the
+/// user and exit non-zero.
+pub fn install_pre_commit_hook(
+    repo_root: &Path,
+) -> Result<InstallHookResult, Box<dyn std::error::Error>> {
+    let git_dir = repo_root.join(".git");
+    // Use fs::metadata (follows symlinks) so a `.git` symlink to a directory
+    // is accepted. Worktrees, where `.git` is a regular *file* pointing to the
+    // real gitdir, are still rejected — they need different hook resolution.
+    let meta = fs::metadata(&git_dir).map_err(|_| -> Box<dyn std::error::Error> {
+        "pkglock: must run install-hook from the git repo root (.git not found in cwd)".into()
+    })?;
+    if !meta.is_dir() {
+        return Err("pkglock: .git is not a directory (git worktrees not supported)".into());
+    }
+
+    let hooks_dir = git_dir.join("hooks");
+    if !hooks_dir.exists() {
+        fs::create_dir_all(&hooks_dir)?;
+    } else if !hooks_dir.is_dir() {
+        return Err(format!(
+            "pkglock: {} exists but is not a directory",
+            hooks_dir.display()
+        )
+        .into());
+    }
+
+    let hook_path = hooks_dir.join("pre-commit");
+    if hook_path.exists() {
+        return Ok(InstallHookResult::AlreadyExists);
+    }
+
+    fs::write(&hook_path, PRE_COMMIT_HOOK)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&hook_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&hook_path, perms)?;
+    }
+
+    Ok(InstallHookResult::Installed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1143,6 +1231,119 @@ registry=http://verdaccio.lan
         assert_eq!(
             updated["dependencies"]["yes"]["resolved"],
             "http://localhost:4873/a/-/a-1.0.0.tgz"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // install-hook tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_install_pre_commit_hook_fresh_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+
+        let result = install_pre_commit_hook(dir.path()).unwrap();
+        assert!(matches!(result, InstallHookResult::Installed));
+
+        let hook_path = dir.path().join(".git/hooks/pre-commit");
+        assert!(hook_path.exists(), "hook file should exist");
+        let body = fs::read_to_string(&hook_path).unwrap();
+        assert!(body.starts_with("#!/bin/sh"), "missing shebang: {body}");
+        assert!(
+            body.contains("pkglock --to-public"),
+            "missing marker string: {body}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&hook_path).unwrap().permissions().mode();
+            assert!(
+                mode & 0o111 != 0,
+                "expected executable bit set, got mode {mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_install_pre_commit_hook_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git/hooks")).unwrap();
+        let hook_path = dir.path().join(".git/hooks/pre-commit");
+        let existing = "#!/bin/sh\necho 'my own hook'\n";
+        fs::write(&hook_path, existing).unwrap();
+
+        let result = install_pre_commit_hook(dir.path()).unwrap();
+        assert!(matches!(result, InstallHookResult::AlreadyExists));
+
+        let after = fs::read_to_string(&hook_path).unwrap();
+        assert_eq!(after, existing, "existing hook must not be modified");
+    }
+
+    #[test]
+    fn test_install_pre_commit_hook_missing_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = install_pre_commit_hook(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(".git"), "expected .git in error: {msg}");
+    }
+
+    #[test]
+    fn test_install_pre_commit_hook_git_is_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        let err = install_pre_commit_hook(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a directory") || msg.contains("worktree"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_install_pre_commit_hook_symlinked_git() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real_git = dir.path().join("real-git");
+        fs::create_dir(&real_git).unwrap();
+        symlink(&real_git, dir.path().join(".git")).unwrap();
+        let result = install_pre_commit_hook(dir.path()).unwrap();
+        assert!(matches!(result, InstallHookResult::Installed));
+        assert!(dir.path().join(".git/hooks/pre-commit").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pre_commit_hook_script_is_valid_posix_sh() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        install_pre_commit_hook(dir.path()).unwrap();
+        let hook = dir.path().join(".git/hooks/pre-commit");
+        let output = Command::new("sh")
+            .arg("-n")
+            .arg(&hook)
+            .output()
+            .expect("failed to invoke sh -n");
+        assert!(
+            output.status.success(),
+            "hook script failed syntax check: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn test_install_pre_commit_hook_hooks_is_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".git/hooks"), "not a dir").unwrap();
+        let err = install_pre_commit_hook(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a directory") || msg.contains("hooks"),
+            "unexpected: {msg}"
         );
     }
 }
