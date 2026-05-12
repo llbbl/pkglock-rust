@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI now runs `cargo test` and `cargo clippy --all-targets --all-features
   -- -D warnings` alongside the existing `rustfmt` job. A separate
   `msrv-build` lane pinned to Rust 1.86 verifies the declared MSRV holds.
+- `Justfile` wraps the common cargo invocations and adds a from-scratch
+  `release VERSION` recipe (bump + CHANGELOG + commit + tag) plus a
+  `tag` recipe for the post-PR-merge case where the version commit is
+  already on `main`.
+- `docs/development.md` documents the daily loop, MSRV verification,
+  both release flows, and recovery from a botched publish. README's
+  Development section links to it.
 
 ### Changed
 
