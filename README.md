@@ -108,15 +108,17 @@ These flags do an unconditional scheme+authority replacement on every `resolved`
 
 ## Development
 
-The project pins its Rust toolchain via `mise.toml`. With [mise](https://mise.jdx.dev) installed, `mise install` in the repo provisions the right rustc automatically. Without mise, install Rust 1.86 or newer manually — the MSRV is enforced by `Cargo.toml`.
+The project pins Rust 1.86 via `mise.toml`. With [mise](https://mise.jdx.dev) installed, `mise install` provisions the right toolchain automatically; otherwise install Rust 1.86 or newer manually.
+
+Common workflows are wrapped in a [Justfile](https://github.com/casey/just):
 
 ```bash
-cargo test --all-targets --all-features
-cargo clippy --all-targets --all-features -- -D warnings
-cargo fmt -- --check
+just check          # fmt-check + clippy + test — matches CI exactly
+just release 0.4.0  # bump version, update CHANGELOG, commit, tag
+just publish        # upload to crates.io
 ```
 
-CI runs `fmt`, `test`, `clippy`, and a build-only `msrv-build` lane on every PR.
+Run `just` with no arguments to list every recipe. See [`docs/development.md`](docs/development.md) for the full guide: daily loop, MSRV verification, release flows (both pre-bumped and from-scratch), and recovery from a botched publish.
 
 ## Why use pkglock?
 
