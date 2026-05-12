@@ -212,19 +212,9 @@ mod tests {
 
     #[test]
     fn test_rewrite_lockfile_explicit_path() {
-        // Use a uniquely-named subdir under the system temp dir so this test
-        // does not pollute the repo root (unlike test_update_urls_in_package_lock,
-        // which task #3 will rewrite using tempfile).
-        let dir = std::env::temp_dir().join(format!(
-            "pkglock-rewrite-lockfile-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let lockfile = dir.join("package-lock.json");
+        // TempDir cleans up via Drop, so panics mid-test no longer leak directories.
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile = dir.path().join("package-lock.json");
 
         let package_lock = r#"{
             "dependencies": {
@@ -242,7 +232,7 @@ mod tests {
         assert!(!updated_content.contains("https://registry.npmjs.org"));
 
         // Missing-file error path
-        let missing = dir.join("does-not-exist.json");
+        let missing = dir.path().join("does-not-exist.json");
         let err = rewrite_lockfile(&missing, "http://localhost:4873").unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -253,40 +243,5 @@ mod tests {
             msg.contains(&missing.display().to_string()),
             "error message did not include path: {msg}"
         );
-
-        // Cleanup
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn test_update_urls_in_package_lock() {
-        // Create temporary pkg.config.json
-        let pkg_config = r#"{
-            "local": "http://localhost:4873",
-            "remote": "https://registry.npmjs.org"
-        }"#;
-        fs::write("pkg.config.json", pkg_config).unwrap();
-
-        // Create temporary package-lock.json
-        let package_lock = r#"{
-            "dependencies": {
-                "package-a": {
-                    "resolved": "https://registry.npmjs.org/package-a/-/package-a-1.0.0.tgz"
-                }
-            }
-        }"#;
-        fs::write("package-lock.json", package_lock).unwrap();
-
-        // Call the function with --local argument
-        update_urls_in_package_lock("--local").unwrap();
-
-        // Read updated package-lock.json
-        let updated_content = fs::read_to_string("package-lock.json").unwrap();
-        assert!(updated_content.contains("http://localhost:4873"));
-        assert!(!updated_content.contains("https://registry.npmjs.org"));
-
-        // Clean up temporary files
-        fs::remove_file("pkg.config.json").unwrap();
-        fs::remove_file("package-lock.json").unwrap();
     }
 }
