@@ -5,23 +5,34 @@ pub mod package_lock_lib {
     use std::fs;
     use std::path::Path;
 
-    // Function to update URLs in a JSON value recursively
+    // Function to update URLs in a JSON value recursively.
+    // Compiles the URL regex once and delegates to an inner helper for recursion.
     pub fn update_urls(value: &mut Value, new_url: &str) {
-        if let Value::Object(map) = value {
-            if let Some(resolved) = map.get_mut("resolved") {
-                if resolved.is_string() {
-                    let old_url = resolved.as_str().unwrap();
-                    // Create a regex to match URLs
-                    let re = Regex::new(r"https?://[^/]+").unwrap();
-                    // Replace the matched part of the URL with the new URL
-                    let updated_url = re.replace(old_url, new_url);
-                    *resolved = Value::String(updated_url.into_owned());
+        let re = Regex::new(r"https?://[^/]+").unwrap();
+        update_urls_inner(value, new_url, &re);
+    }
+
+    fn update_urls_inner(value: &mut Value, new_url: &str, re: &Regex) {
+        match value {
+            Value::Object(map) => {
+                if let Some(resolved) = map.get_mut("resolved") {
+                    if let Some(old_url) = resolved.as_str() {
+                        // Replace the matched part of the URL with the new URL
+                        let updated_url = re.replace(old_url, new_url).into_owned();
+                        *resolved = Value::String(updated_url);
+                    }
+                }
+                // Recursively update nested objects
+                for v in map.values_mut() {
+                    update_urls_inner(v, new_url, re);
                 }
             }
-            // Recursively update nested objects
-            for key in map.keys().cloned().collect::<Vec<_>>() {
-                update_urls(&mut map[&key], new_url);
+            Value::Array(arr) => {
+                for item in arr.iter_mut() {
+                    update_urls_inner(item, new_url, re);
+                }
             }
+            _ => {}
         }
     }
 
@@ -109,6 +120,63 @@ pub mod package_lock_lib {
             update_urls(&mut json, "http://localhost:4873");
             assert_eq!(json["name"], "test-package");
             assert_eq!(json["version"], "1.0.0");
+        }
+
+        #[test]
+        fn test_update_urls_array_recursion() {
+            // Top-level array of objects with `resolved`
+            let mut top_array = json!([
+                { "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz" },
+                { "resolved": "https://registry.npmjs.org/b/-/b-2.0.0.tgz" }
+            ]);
+            update_urls(&mut top_array, "http://localhost:4873");
+            assert_eq!(
+                top_array[0]["resolved"],
+                "http://localhost:4873/a/-/a-1.0.0.tgz"
+            );
+            assert_eq!(
+                top_array[1]["resolved"],
+                "http://localhost:4873/b/-/b-2.0.0.tgz"
+            );
+
+            // Nested: object holding an array of objects with `resolved`
+            let mut nested = json!({
+                "packages": [
+                    { "resolved": "https://registry.npmjs.org/c/-/c-3.0.0.tgz" },
+                    {
+                        "nested": {
+                            "resolved": "https://registry.npmjs.org/d/-/d-4.0.0.tgz"
+                        }
+                    }
+                ]
+            });
+            update_urls(&mut nested, "http://localhost:4873");
+            assert_eq!(
+                nested["packages"][0]["resolved"],
+                "http://localhost:4873/c/-/c-3.0.0.tgz"
+            );
+            assert_eq!(
+                nested["packages"][1]["nested"]["resolved"],
+                "http://localhost:4873/d/-/d-4.0.0.tgz"
+            );
+        }
+
+        #[test]
+        fn test_update_urls_mixed_array() {
+            let mut mixed = json!([
+                "string",
+                42,
+                null,
+                { "resolved": "https://registry.npmjs.org/x/-/x-1.0.0.tgz" }
+            ]);
+            update_urls(&mut mixed, "http://localhost:4873");
+            assert_eq!(mixed[0], "string");
+            assert_eq!(mixed[1], 42);
+            assert!(mixed[2].is_null());
+            assert_eq!(
+                mixed[3]["resolved"],
+                "http://localhost:4873/x/-/x-1.0.0.tgz"
+            );
         }
 
         #[test]
