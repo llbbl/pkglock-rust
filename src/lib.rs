@@ -36,45 +36,80 @@ pub mod package_lock_lib {
         }
     }
 
-    // Function that reads pkg.config.json and package-lock.json, updates the package-lock.json with the new URL,
-    // and writes the updated JSON back to package-lock.json
-    pub fn update_urls_in_package_lock(arg: &str) -> Result<(), Box<dyn std::error::Error>> {
-        // Check that the required files exist
-        if !Path::new("pkg.config.json").exists() {
+    // Core primitive: read the given lockfile, rewrite its URLs to `new_url`, and write it back.
+    // This function knows nothing about pkg.config.json or --local/--remote.
+    pub fn rewrite_lockfile(
+        lockfile: &Path,
+        new_url: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !lockfile.exists() {
+            return Err(format!("lockfile not found: {}", lockfile.display()).into());
+        }
+
+        // Read and parse the lockfile
+        let file_content = fs::read_to_string(lockfile)?;
+        let mut json_content: Value = serde_json::from_str(&file_content)?;
+
+        // Update URLs using the update_urls function within this module
+        update_urls(&mut json_content, new_url);
+
+        // Write the updated JSON back to the lockfile
+        let updated_content = serde_json::to_string_pretty(&json_content)?;
+        fs::write(lockfile, updated_content)?;
+        Ok(())
+    }
+
+    // Resolves the URL to use from `config` based on `arg` (--local or --remote), then
+    // delegates to `rewrite_lockfile` against the given lockfile path.
+    pub fn update_urls_from_config(
+        config: &Path,
+        lockfile: &Path,
+        arg: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Check that the required files exist (preserve historical error messages)
+        if !config.exists() {
             return Err("pkg.config.json not found".into());
         }
-        if !Path::new("package-lock.json").exists() {
+        if !lockfile.exists() {
             return Err("package-lock.json not found".into());
         }
 
-        // Read and parse package-lock.json
-        let file_content = fs::read_to_string("package-lock.json")?;
+        // Read+parse lockfile FIRST (matches historical ordering for malformed-JSON precedence).
+        let file_content = fs::read_to_string(lockfile)?;
         let mut json_content: Value = serde_json::from_str(&file_content)?;
 
-        // Read and parse pkg.config.json
-        let config_content = fs::read_to_string("pkg.config.json")?;
-        let config: Value = serde_json::from_str(&config_content)?;
+        // Then read+parse pkg.config.json.
+        let config_content = fs::read_to_string(config)?;
+        let config_json: Value = serde_json::from_str(&config_content)?;
 
         // Determine new URL based on argument
         let new_url = if arg == "--local" {
-            config["local"]
+            config_json["local"]
                 .as_str()
                 .ok_or("Local URL not found in pkg.config.json")?
         } else if arg == "--remote" {
-            config["remote"]
+            config_json["remote"]
                 .as_str()
                 .ok_or("Remote URL not found in pkg.config.json")?
         } else {
             return Err("Invalid argument. Use --local or --remote.".into());
         };
 
-        // Update URLs using the update_urls function within this module
         update_urls(&mut json_content, new_url);
-
-        // Write the updated JSON back to package-lock.json
         let updated_content = serde_json::to_string_pretty(&json_content)?;
-        fs::write("package-lock.json", updated_content)?;
+        fs::write(lockfile, updated_content)?;
         Ok(())
+    }
+
+    // Back-compat wrapper that resolves cwd-relative `pkg.config.json` and `package-lock.json`,
+    // picks the URL based on `--local` or `--remote`, then delegates to `rewrite_lockfile`.
+    // This is the single site where cwd-coupling is encoded.
+    pub fn update_urls_in_package_lock(arg: &str) -> Result<(), Box<dyn std::error::Error>> {
+        update_urls_from_config(
+            Path::new("pkg.config.json"),
+            Path::new("package-lock.json"),
+            arg,
+        )
     }
 
     #[cfg(test)]
@@ -177,6 +212,54 @@ pub mod package_lock_lib {
                 mixed[3]["resolved"],
                 "http://localhost:4873/x/-/x-1.0.0.tgz"
             );
+        }
+
+        #[test]
+        fn test_rewrite_lockfile_explicit_path() {
+            // Use a uniquely-named subdir under the system temp dir so this test
+            // does not pollute the repo root (unlike test_update_urls_in_package_lock,
+            // which task #3 will rewrite using tempfile).
+            let dir = std::env::temp_dir().join(format!(
+                "pkglock-rewrite-lockfile-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let lockfile = dir.join("package-lock.json");
+
+            let package_lock = r#"{
+                "dependencies": {
+                    "package-a": {
+                        "resolved": "https://registry.npmjs.org/package-a/-/package-a-1.0.0.tgz"
+                    }
+                }
+            }"#;
+            fs::write(&lockfile, package_lock).unwrap();
+
+            rewrite_lockfile(&lockfile, "http://localhost:4873").unwrap();
+
+            let updated_content = fs::read_to_string(&lockfile).unwrap();
+            assert!(updated_content.contains("http://localhost:4873"));
+            assert!(!updated_content.contains("https://registry.npmjs.org"));
+
+            // Missing-file error path
+            let missing = dir.join("does-not-exist.json");
+            let err = rewrite_lockfile(&missing, "http://localhost:4873").unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("lockfile not found"),
+                "unexpected error message: {msg}"
+            );
+            assert!(
+                msg.contains(&missing.display().to_string()),
+                "error message did not include path: {msg}"
+            );
+
+            // Cleanup
+            fs::remove_dir_all(&dir).unwrap();
         }
 
         #[test]
