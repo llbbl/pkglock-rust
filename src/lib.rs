@@ -275,6 +275,154 @@ pub fn rewrite_lockfile_to_public(lockfile: &Path) -> Result<usize, Box<dyn std:
     Ok(count)
 }
 
+/// Validate a user-supplied local registry URL and return the normalized
+/// `scheme://authority[/base-path]` prefix that should replace
+/// `scheme://registry.npmjs.org` in resolved URLs.
+///
+/// Rules:
+/// - Must parse as a URL.
+/// - Scheme must be `http` or `https`.
+/// - Must have a host.
+/// - Must not have a query or fragment (registry base URLs don't carry those).
+/// - Any trailing `/` on the path is trimmed so the splice doesn't produce
+///   double slashes when the original npmjs URL's path is appended.
+fn normalize_local_url(local_url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let parsed = Url::parse(local_url)
+        .map_err(|e| format!("invalid --to-local URL '{}': {}", local_url, e))?;
+
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!(
+            "invalid --to-local URL '{}': scheme must be http or https",
+            local_url
+        )
+        .into());
+    }
+    match parsed.host_str() {
+        None => return Err(format!("invalid --to-local URL '{}': missing host", local_url).into()),
+        Some("") => {
+            return Err(format!("invalid --to-local URL '{}': missing host", local_url).into())
+        }
+        _ => {}
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(format!(
+            "invalid --to-local URL '{}': must not have query or fragment",
+            local_url
+        )
+        .into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "invalid --to-local URL '{}': must not embed credentials (use .npmrc _authToken)",
+            local_url
+        )
+        .into());
+    }
+
+    // Slice scheme://authority[/path] out of the original input by reusing
+    // scheme_authority_len. Query/fragment are rejected above, so everything
+    // after auth_end is path. Trim a single trailing '/' so the splice with
+    // the original npmjs path (which starts with '/') doesn't double-slash;
+    // a bare '/' path collapses to empty.
+    let auth_end = scheme_authority_len(local_url, &parsed);
+    let path = &local_url[auth_end..];
+    let path = path.strip_suffix('/').unwrap_or(path);
+    Ok(format!("{}{}", &local_url[..auth_end], path))
+}
+
+/// Parse `registry=...` from a .npmrc-style file. Supports:
+/// - Comments starting with `#` or `;` (line start or after whitespace).
+/// - Surrounding double or single quotes on the value.
+/// - Case-insensitive `registry` key.
+/// - Last-write-wins for repeated keys (matches npm semantics).
+/// - UTF-8 BOM at the start of the file.
+///
+/// Scoped `@scope:registry=...` overrides are ignored.
+/// Does NOT expand environment variable references like `${VAR}`.
+/// Returns the raw value (no URL validation here), or `None` for missing
+/// files or files without a bare `registry=` entry.
+pub fn npmrc_registry(npmrc: &Path) -> Option<String> {
+    let content = fs::read_to_string(npmrc).ok()?;
+    let mut found: Option<String> = None;
+    for raw_line in content.lines() {
+        // Strip a leading UTF-8 BOM (only meaningful on the first line, but
+        // cheap to attempt unconditionally).
+        let line = raw_line.trim_start_matches('\u{feff}').trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        // Only the bare `registry` key — skip scoped overrides like
+        // `@my-org:registry`.
+        if !key.trim().eq_ignore_ascii_case("registry") {
+            continue;
+        }
+        let value = value.trim();
+        // Strip an inline whitespace-prefixed comment: " # ..." or " ; ...".
+        // Only treat `#`/`;` as a comment when preceded by whitespace — npm
+        // permits a literal `#` in the value when not preceded by space.
+        let value = match value.find([' ', '\t']) {
+            Some(i)
+                if matches!(
+                    value[i..].trim_start().chars().next(),
+                    Some('#') | Some(';')
+                ) =>
+            {
+                value[..i].trim_end()
+            }
+            _ => value,
+        };
+        // Strip matching surrounding quotes ("..." or '...').
+        let value = value
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+            .unwrap_or(value);
+        if !value.is_empty() {
+            found = Some(value.to_string());
+        }
+    }
+    found
+}
+
+/// Read the lockfile, rewrite any `resolved` URL whose host is exactly
+/// `registry.npmjs.org` to point at `local_url`, write it back, and return the
+/// number of URLs changed.
+pub fn rewrite_lockfile_to_local(
+    lockfile: &Path,
+    local_url: &str,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let local_prefix = normalize_local_url(local_url)?;
+
+    if !lockfile.exists() {
+        return Err(format!("lockfile not found: {}", lockfile.display()).into());
+    }
+
+    let file_content = fs::read_to_string(lockfile)?;
+    let mut json_content: Value = serde_json::from_str(&file_content)?;
+
+    let decide = |parsed: &Url| -> RewriteDecision {
+        // host_str() returns the parsed host's canonical form: ASCII-lowercased,
+        // IDN punycoded. The constant "registry.npmjs.org" is already canonical,
+        // so exact == is correct. If this constant ever changes to a host with
+        // uppercase or non-ASCII, switch to a normalized comparison.
+        if parsed.host_str() == Some("registry.npmjs.org") {
+            RewriteDecision::ReplaceSchemeAuthority(local_prefix.clone())
+        } else {
+            RewriteDecision::Skip
+        }
+    };
+
+    let count = walk_resolved_urls(&mut json_content, &decide);
+
+    let updated_content = serde_json::to_string_pretty(&json_content)?;
+    fs::write(lockfile, updated_content)?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,6 +757,392 @@ mod tests {
         assert_eq!(
             updated["resolved"],
             "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz?token=abc#sha"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // --to-local tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_npmrc_registry_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        fs::write(&npmrc, "registry=https://registry.npmjs.org/\n").unwrap();
+        assert_eq!(
+            npmrc_registry(&npmrc),
+            Some("https://registry.npmjs.org/".to_string())
+        );
+    }
+
+    #[test]
+    fn test_npmrc_registry_whitespace_and_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        fs::write(&npmrc, "  Registry  =   http://localhost:4873  \n").unwrap();
+        assert_eq!(
+            npmrc_registry(&npmrc),
+            Some("http://localhost:4873".to_string())
+        );
+    }
+
+    #[test]
+    fn test_npmrc_registry_comments_and_blanks_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        let body = "\
+# a comment
+; another comment
+
+registry=http://verdaccio.lan:4873
+";
+        fs::write(&npmrc, body).unwrap();
+        assert_eq!(
+            npmrc_registry(&npmrc),
+            Some("http://verdaccio.lan:4873".to_string())
+        );
+    }
+
+    #[test]
+    fn test_npmrc_registry_scoped_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        let body = "\
+@my-org:registry=https://scoped.example.com/
+";
+        fs::write(&npmrc, body).unwrap();
+        assert_eq!(npmrc_registry(&npmrc), None);
+    }
+
+    #[test]
+    fn test_npmrc_registry_scoped_does_not_shadow_bare() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        let body = "\
+@my-org:registry=https://scoped.example.com/
+registry=http://localhost:4873
+";
+        fs::write(&npmrc, body).unwrap();
+        assert_eq!(
+            npmrc_registry(&npmrc),
+            Some("http://localhost:4873".to_string())
+        );
+    }
+
+    #[test]
+    fn test_npmrc_registry_no_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        fs::write(&npmrc, "save-exact=true\n").unwrap();
+        assert_eq!(npmrc_registry(&npmrc), None);
+    }
+
+    #[test]
+    fn test_npmrc_registry_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        fs::write(&npmrc, "").unwrap();
+        assert_eq!(npmrc_registry(&npmrc), None);
+    }
+
+    #[test]
+    fn test_npmrc_registry_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join("does-not-exist");
+        assert_eq!(npmrc_registry(&npmrc), None);
+    }
+
+    #[test]
+    fn test_rewrite_lockfile_to_local_mixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile = dir.path().join("package-lock.json");
+        let package_lock = r#"{
+            "dependencies": {
+                "from-npmjs": {
+                    "resolved": "https://registry.npmjs.org/from-npmjs/-/from-npmjs-1.0.0.tgz"
+                },
+                "from-external": {
+                    "resolved": "https://example.com/from-external/-/from-external-4.0.0.tgz"
+                },
+                "from-local": {
+                    "resolved": "http://localhost:4873/from-local/-/from-local-1.0.0.tgz"
+                }
+            }
+        }"#;
+        fs::write(&lockfile, package_lock).unwrap();
+
+        let count = rewrite_lockfile_to_local(&lockfile, "http://localhost:4873").unwrap();
+        assert_eq!(count, 1, "only the npmjs URL should be rewritten");
+
+        let updated: Value = serde_json::from_str(&fs::read_to_string(&lockfile).unwrap()).unwrap();
+        assert_eq!(
+            updated["dependencies"]["from-npmjs"]["resolved"],
+            "http://localhost:4873/from-npmjs/-/from-npmjs-1.0.0.tgz"
+        );
+        assert_eq!(
+            updated["dependencies"]["from-external"]["resolved"],
+            "https://example.com/from-external/-/from-external-4.0.0.tgz"
+        );
+        assert_eq!(
+            updated["dependencies"]["from-local"]["resolved"],
+            "http://localhost:4873/from-local/-/from-local-1.0.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_lockfile_to_local_path_bearing_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile = dir.path().join("package-lock.json");
+        let package_lock = r#"{
+            "resolved": "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz"
+        }"#;
+        fs::write(&lockfile, package_lock).unwrap();
+        let count = rewrite_lockfile_to_local(&lockfile, "https://verdaccio.lan/repo").unwrap();
+        assert_eq!(count, 1);
+        let updated: Value = serde_json::from_str(&fs::read_to_string(&lockfile).unwrap()).unwrap();
+        assert_eq!(
+            updated["resolved"],
+            "https://verdaccio.lan/repo/pkg/-/pkg-1.0.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_lockfile_to_local_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile = dir.path().join("package-lock.json");
+        let package_lock = r#"{
+            "resolved": "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz"
+        }"#;
+        fs::write(&lockfile, package_lock).unwrap();
+        let count = rewrite_lockfile_to_local(&lockfile, "http://localhost:4873/").unwrap();
+        assert_eq!(count, 1);
+        let updated: Value = serde_json::from_str(&fs::read_to_string(&lockfile).unwrap()).unwrap();
+        assert_eq!(
+            updated["resolved"],
+            "http://localhost:4873/pkg/-/pkg-1.0.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_lockfile_to_local_path_bearing_url_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile = dir.path().join("package-lock.json");
+        let package_lock = r#"{
+            "resolved": "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz"
+        }"#;
+        fs::write(&lockfile, package_lock).unwrap();
+        let count = rewrite_lockfile_to_local(&lockfile, "https://verdaccio.lan/repo/").unwrap();
+        assert_eq!(count, 1);
+        let updated: Value = serde_json::from_str(&fs::read_to_string(&lockfile).unwrap()).unwrap();
+        assert_eq!(
+            updated["resolved"],
+            "https://verdaccio.lan/repo/pkg/-/pkg-1.0.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_lockfile_to_local_preserves_query_and_fragment() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile = dir.path().join("package-lock.json");
+        let package_lock = r#"{
+            "resolved": "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz?token=abc#sha"
+        }"#;
+        fs::write(&lockfile, package_lock).unwrap();
+        let count = rewrite_lockfile_to_local(&lockfile, "http://localhost:4873").unwrap();
+        assert_eq!(count, 1);
+        let updated: Value = serde_json::from_str(&fs::read_to_string(&lockfile).unwrap()).unwrap();
+        assert_eq!(
+            updated["resolved"],
+            "http://localhost:4873/pkg/-/pkg-1.0.0.tgz?token=abc#sha"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_lockfile_to_local_no_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile = dir.path().join("package-lock.json");
+        let original = r#"{
+  "dependencies": {
+    "a": {
+      "resolved": "https://example.com/a/-/a-1.0.0.tgz"
+    }
+  }
+}"#;
+        fs::write(&lockfile, original).unwrap();
+        let count = rewrite_lockfile_to_local(&lockfile, "http://localhost:4873").unwrap();
+        assert_eq!(count, 0);
+        // Content-equivalent (we re-serialize, so we compare parsed values).
+        let after: Value = serde_json::from_str(&fs::read_to_string(&lockfile).unwrap()).unwrap();
+        let before: Value = serde_json::from_str(original).unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn test_rewrite_lockfile_to_local_invalid_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile = dir.path().join("package-lock.json");
+        fs::write(&lockfile, r#"{"resolved":"https://registry.npmjs.org/x"}"#).unwrap();
+        // Not parseable.
+        assert!(rewrite_lockfile_to_local(&lockfile, "not a url").is_err());
+        // Wrong scheme.
+        assert!(rewrite_lockfile_to_local(&lockfile, "ftp://localhost:4873").is_err());
+        // Missing host (parser rejects bare scheme://).
+        assert!(rewrite_lockfile_to_local(&lockfile, "http://").is_err());
+        // Has query/fragment (rejected up front).
+        assert!(rewrite_lockfile_to_local(&lockfile, "http://localhost?x=1").is_err());
+        assert!(rewrite_lockfile_to_local(&lockfile, "http://localhost#frag").is_err());
+    }
+
+    #[test]
+    fn test_rewrite_lockfile_to_local_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.json");
+        let err = rewrite_lockfile_to_local(&missing, "http://localhost:4873").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("lockfile not found"), "unexpected: {msg}");
+        assert!(
+            msg.contains(&missing.display().to_string()),
+            "error message did not include path: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_lockfile_to_local_rejects_userinfo() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile = dir.path().join("package-lock.json");
+        fs::write(&lockfile, r#"{"resolved":"https://registry.npmjs.org/x"}"#).unwrap();
+        let err = rewrite_lockfile_to_local(&lockfile, "http://u:p@localhost:4873").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must not embed credentials"),
+            "unexpected: {msg}"
+        );
+        // Username-only (no password) should also be rejected.
+        let err = rewrite_lockfile_to_local(&lockfile, "http://user@localhost:4873").unwrap_err();
+        assert!(
+            err.to_string().contains("must not embed credentials"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_npmrc_registry_last_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        let body = "\
+registry=https://registry.npmjs.org/
+# overridden for this checkout
+registry=http://verdaccio.lan
+";
+        fs::write(&npmrc, body).unwrap();
+        assert_eq!(
+            npmrc_registry(&npmrc),
+            Some("http://verdaccio.lan".to_string())
+        );
+    }
+
+    #[test]
+    fn test_npmrc_registry_bom_prefixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        let body = "\u{feff}registry=http://localhost:4873\n";
+        fs::write(&npmrc, body).unwrap();
+        assert_eq!(
+            npmrc_registry(&npmrc),
+            Some("http://localhost:4873".to_string())
+        );
+    }
+
+    #[test]
+    fn test_npmrc_registry_inline_comment_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        fs::write(&npmrc, "registry=http://localhost:4873 # local mirror\n").unwrap();
+        assert_eq!(
+            npmrc_registry(&npmrc),
+            Some("http://localhost:4873".to_string())
+        );
+    }
+
+    #[test]
+    fn test_npmrc_registry_inline_comment_semicolon() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        fs::write(&npmrc, "registry=http://localhost:4873\t; trailing\n").unwrap();
+        assert_eq!(
+            npmrc_registry(&npmrc),
+            Some("http://localhost:4873".to_string())
+        );
+    }
+
+    #[test]
+    fn test_npmrc_registry_double_quoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        fs::write(&npmrc, "registry=\"https://registry.npmjs.org/\"\n").unwrap();
+        assert_eq!(
+            npmrc_registry(&npmrc),
+            Some("https://registry.npmjs.org/".to_string())
+        );
+    }
+
+    #[test]
+    fn test_npmrc_registry_single_quoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        fs::write(&npmrc, "registry='http://localhost:4873'\n").unwrap();
+        assert_eq!(
+            npmrc_registry(&npmrc),
+            Some("http://localhost:4873".to_string())
+        );
+    }
+
+    #[test]
+    fn test_npmrc_registry_hash_in_value_without_whitespace_preserved() {
+        // npm allows a literal `#` in the value when not preceded by whitespace.
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        fs::write(&npmrc, "registry=http://localhost:4873/path#anchor\n").unwrap();
+        assert_eq!(
+            npmrc_registry(&npmrc),
+            Some("http://localhost:4873/path#anchor".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_lockfile_to_local_exact_host_match() {
+        // Only `registry.npmjs.org` should be rewritten — not `.com` variants
+        // or subdomains.
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile = dir.path().join("package-lock.json");
+        let package_lock = r#"{
+            "dependencies": {
+                "wrong-tld": {
+                    "resolved": "https://registry.npmjs.com/a/-/a-1.0.0.tgz"
+                },
+                "subdomain": {
+                    "resolved": "https://foo.registry.npmjs.org/a/-/a-1.0.0.tgz"
+                },
+                "yes": {
+                    "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz"
+                }
+            }
+        }"#;
+        fs::write(&lockfile, package_lock).unwrap();
+        let count = rewrite_lockfile_to_local(&lockfile, "http://localhost:4873").unwrap();
+        assert_eq!(count, 1);
+        let updated: Value = serde_json::from_str(&fs::read_to_string(&lockfile).unwrap()).unwrap();
+        assert_eq!(
+            updated["dependencies"]["wrong-tld"]["resolved"],
+            "https://registry.npmjs.com/a/-/a-1.0.0.tgz"
+        );
+        assert_eq!(
+            updated["dependencies"]["subdomain"]["resolved"],
+            "https://foo.registry.npmjs.org/a/-/a-1.0.0.tgz"
+        );
+        assert_eq!(
+            updated["dependencies"]["yes"]["resolved"],
+            "http://localhost:4873/a/-/a-1.0.0.tgz"
         );
     }
 }
