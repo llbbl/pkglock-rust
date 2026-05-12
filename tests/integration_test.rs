@@ -1,4 +1,4 @@
-use pkglock_lib::package_lock_lib::{update_urls, update_urls_in_package_lock};
+use pkglock_lib::{update_urls, update_urls_in_package_lock};
 use serde_json::Value;
 use std::fs;
 
